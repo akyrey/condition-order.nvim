@@ -1,0 +1,279 @@
+*condition-order.txt*   Performance linter for if-condition ordering
+
+==============================================================================
+CONTENTS                                          *condition-order-contents*
+
+  1. Introduction ................. |condition-order-intro|
+  2. Requirements ................. |condition-order-requirements|
+  3. Installation ................. |condition-order-installation|
+  4. Usage ........................ |condition-order-usage|
+  5. Commands ..................... |condition-order-commands|
+  6. Configuration ................ |condition-order-config|
+  7. Cost Model ................... |condition-order-cost-model|
+  8. Safety Rules ................. |condition-order-safety|
+  9. Extending .................... |condition-order-extending|
+  10. Lua API ...................... |condition-order-api|
+
+==============================================================================
+1. INTRODUCTION                                   *condition-order-intro*
+
+condition-order.nvim analyses `&&` and `||` chains in PHP and Go source
+files and warns you when an expensive operand precedes a cheaper one.
+
+Putting cheap checks first means failures short-circuit sooner, reducing
+average evaluation cost.  Think of it as a lightweight performance linter for
+conditional expressions.
+
+Example (PHP): >
+    // Before (plugin warns):
+    if ($user->isAdmin() && $isEnabled) { ... }
+
+    // After (plugin suggests):
+    if ($isEnabled && $user->isAdmin()) { ... }
+<
+==============================================================================
+2. REQUIREMENTS                                   *condition-order-requirements*
+
+  - Neovim >= 0.9
+  - nvim-treesitter with the relevant parsers:
+      :TSInstall php
+      :TSInstall go
+
+==============================================================================
+3. INSTALLATION                                   *condition-order-installation*
+
+With lazy.nvim: >
+    {
+      "yourusername/condition-order.nvim",
+      ft   = { "php", "go" },
+      opts = {},
+    }
+<
+With packer.nvim: >
+    use {
+      "yourusername/condition-order.nvim",
+      config = function()
+        require("condition-order").setup()
+      end,
+    }
+<
+==============================================================================
+4. USAGE                                          *condition-order-usage*
+
+The plugin runs automatically on |BufWritePost| and |BufReadPost| for
+supported filetypes.  Diagnostics appear inline like LSP warnings.
+
+When you trigger `vim.lsp.buf.code_action()` (e.g. `<leader>ca`), fixes
+appear alongside your LSP actions: >
+    ⚡ Reorder conditions on line 5 (cheapest first)
+    ⚡ Reorder ALL conditions in buffer (3 fixes)
+<
+Without an LSP server, use |:ConditionOrderActions| instead.
+
+Per-line opt-out~
+
+Add the ignore comment anywhere on the same lines as the condition: >
+    if ($expensive->call() && $cheap) { // condition-order: ignore
+<
+Per-buffer opt-out~
+
+Set the buffer-local variable: >
+    vim.b.condition_order_disable = true
+<
+==============================================================================
+5. COMMANDS                                       *condition-order-commands*
+
+                                                  *:ConditionOrderAnalyze*
+:ConditionOrderAnalyze
+    Run analysis on the current buffer and refresh diagnostics.
+
+                                                  *:ConditionOrderFix*
+:ConditionOrderFix
+    Auto-fix all safe condition-ordering issues in the current buffer.
+    Issues where the auto-fix would be unsafe (side effects, null guards,
+    multi-line operands, comments) are reported as diagnostics only.
+
+                                                  *:ConditionOrderToggle*
+:ConditionOrderToggle
+    Enable or disable the plugin globally.
+
+                                                  *:ConditionOrderActions*
+:ConditionOrderActions
+    Show condition-order code actions at the cursor (standalone mode,
+    works even without an LSP server).
+
+==============================================================================
+6. CONFIGURATION                                  *condition-order-config*
+
+Pass options to `require("condition-order").setup({ ... })`: >
+
+    require("condition-order").setup({
+      -- Filetypes to analyse
+      filetypes = { "php", "go" },
+
+      -- Minimum cost difference to trigger a warning
+      threshold = 2,
+
+      -- Auto-analyse on save / open
+      auto_analyze = true,
+
+      -- Diagnostic severity
+      severity = vim.diagnostic.severity.HINT,
+
+      -- Register as an LSP code action source
+      register_code_actions = true,
+
+      -- Milliseconds to debounce autocmd-triggered analysis
+      analyze_debounce_ms = 300,
+
+      -- Skip buffers larger than this many bytes (nil = no limit)
+      max_buffer_bytes = nil,
+
+      -- Functions your codebase uses that are side-effect-free.
+      -- Calls listed here may be moved to earlier positions safely.
+      assume_pure = {
+        "Cache::get",
+        "myservice.IsReady",
+      },
+
+      -- Comment text that suppresses analysis on the same line(s).
+      ignore_comment = "condition-order: ignore",
+
+      -- Custom cost overrides (function name → cost integer)
+      cost_overrides = {
+        ["DB::table"]    = 20,
+        ["Cache::get"]   = 15,
+        ["mydb.Query"]   = 20,
+      },
+
+      -- Patterns considered "IO/expensive"
+      expensive_patterns = {
+        "query", "fetch", "find", "load",
+        "file_get_contents", "curl",
+        "ReadFile", "WriteFile", "Dial",
+      },
+    })
+<
+==============================================================================
+7. COST MODEL                                     *condition-order-cost-model*
+
+Each expression type has a cost score representing approximate evaluation
+effort.  The analyser reorders operands from cheapest to most expensive.
+
+PHP costs~
+
+  Literal / boolean / null        1
+  Variable                        2
+  isset / empty / is_*            3
+  Class::CONST                    3
+  Array access $a['k']            4
+  Property access ->prop          5
+  Built-in function               3-9
+  Method call                     10
+  Object creation (new)           12
+  DB / IO calls                   20
+
+Go costs~
+
+  Literal / true / false / nil    1
+  Identifier (variable)           2
+  len() / cap()                   2
+  Field access .Field             4
+  strings.HasPrefix               4
+  strings.Contains                5
+  call_expression (generic)       8
+  json.Marshal / Unmarshal        12
+  os.Stat                         15
+  os.Open / os.ReadFile           20
+  http.Get / sql queries          20-25
+
+Negation is free: `!expr` costs the same as `expr`. >
+    if (!$user->isAdmin() && $isEnabled) { }
+    -- same cost analysis as:
+    if ($user->isAdmin() && $isEnabled) { }
+<
+==============================================================================
+8. SAFETY RULES                                   *condition-order-safety*
+
+The plugin is conservative about auto-fix to avoid changing program behaviour.
+A diagnostic is always emitted; the fix is suppressed when:
+
+  - An operand being moved EARLIER contains an unknown call expression
+    (calls with side effects must not be advanced in the chain).
+    Add pure functions to `assume_pure` to unlock fixes for them.
+
+  - A null/nil guard (`$x !== null`, `isset($x)`, `x != nil`) protects a
+    later operand that accesses the same variable.  Moving the dependent
+    before its guard would cause a null-deref.
+
+  - Any operand spans multiple lines (reconstruction would collapse
+    formatting).
+
+  - Any operand contains a comment node (comments would be discarded).
+
+In all blocked cases the diagnostic message explains why, so you can
+perform the reorder manually with full context.
+
+==============================================================================
+9. EXTENDING                                      *condition-order-extending*
+
+Adding a new language~
+
+  1. Add a cost table `M.<lang>_costs` and `M.<lang>_known_functions` to
+     `lua/condition-order/cost.lua`.
+  2. Update `M.score`, `M.resolve_call_name`, and `M.is_known_pure` to
+     dispatch on the new language.
+  3. Add condition-context node types to `CONDITION_STARTERS` and body
+     node types to `BODY_NODES` in `lua/condition-order/analyzer.lua`.
+  4. Add the filetype to your config.
+
+Custom cost overrides~
+
+Override any function's cost via `cost_overrides`: >
+    require("condition-order").setup({
+      cost_overrides = {
+        ["ElasticSearch::search"] = 25,
+        ["Redis::pipeline"]       = 12,
+        ["elasticsearch.Search"]  = 25,
+      },
+    })
+<
+==============================================================================
+10. LUA API                                       *condition-order-api*
+
+                                                  *condition-order.setup()*
+`require("condition-order").setup(opts?)`
+    Initialise the plugin.  Must be called once.  See |condition-order-config|.
+
+                                                  *condition-order.analyze()*
+`require("condition-order").analyze(bufnr?)`
+    Run analysis and refresh diagnostics for bufnr (default: current buffer).
+
+                                                  *condition-order.fix()*
+`require("condition-order").fix(bufnr?)`
+    Apply all safe fixes in bufnr.
+
+                                                  *condition-order.count()*
+`require("condition-order").count(bufnr?)`
+    Return the number of pending diagnostics in bufnr.  Useful for
+    statusline components: >
+        require("lualine").setup({
+          sections = {
+            lualine_x = {
+              function()
+                local n = require("condition-order").count()
+                return n > 0 and ("⚡ " .. n) or ""
+              end,
+            },
+          },
+        })
+<
+                                                  *condition-order.toggle()*
+`require("condition-order").toggle()`
+    Toggle analysis on/off globally.
+
+                                                  *condition-order.get_namespace()*
+`require("condition-order").get_namespace()`
+    Return the |nvim_create_namespace()| ID used for diagnostics.
+
+vim:tw=78:ts=8:et:ft=help:norl:
