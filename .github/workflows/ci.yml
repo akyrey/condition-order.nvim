@@ -52,12 +52,17 @@ jobs:
 
       - name: Install nvim-treesitter + parsers
         run: |
-          git clone --depth 1 https://github.com/nvim-treesitter/nvim-treesitter \
+          git clone --depth 1 -b master https://github.com/nvim-treesitter/nvim-treesitter \
               ~/.local/share/nvim/lazy/nvim-treesitter
-          nvim --headless --noplugin \
+          nvim --headless \
                -c "set rtp+=~/.local/share/nvim/lazy/nvim-treesitter" \
+               -c "runtime! plugin/nvim-treesitter.lua" \
                -c "TSInstallSync php go python" \
-               -c "qa" || true
+               -c "qa"
+          for lang in php go python; do
+            test -f ~/.local/share/nvim/lazy/nvim-treesitter/parser/$lang.so \
+              || { echo "missing parser: $lang"; exit 1; }
+          done
 
       - name: Run tests
         run: |

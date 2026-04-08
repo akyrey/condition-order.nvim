@@ -10,7 +10,7 @@ describe("config.setup", function()
 
 	it("defaults are applied when setup() called with no args", function()
 		config.setup()
-		assert.are.same({ "php", "go" }, config.options.filetypes)
+		assert.are.same({ "php", "go", "python" }, config.options.filetypes)
 		assert.are.equal(2, config.options.threshold)
 		assert.are.equal(300, config.options.analyze_debounce_ms)
 		assert.are.same({}, config.options.assume_pure)
@@ -22,7 +22,7 @@ describe("config.setup", function()
 		assert.are.equal(5, config.options.threshold)
 		assert.are.same({ "MyService::find" }, config.options.assume_pure)
 		-- other defaults preserved
-		assert.are.same({ "php", "go" }, config.options.filetypes)
+		assert.are.same({ "php", "go", "python" }, config.options.filetypes)
 	end)
 
 	it("calling setup() twice resets to defaults + new opts", function()
