@@ -56,7 +56,7 @@ jobs:
               ~/.local/share/nvim/lazy/nvim-treesitter
           nvim --headless --noplugin \
                -c "set rtp+=~/.local/share/nvim/lazy/nvim-treesitter" \
-               -c "TSInstallSync php go" \
+               -c "TSInstallSync php go python" \
                -c "qa" || true
 
       - name: Run tests

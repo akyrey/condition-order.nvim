@@ -1,17 +1,19 @@
 # condition-order.nvim
 
-A Neovim plugin that analyzes condition ordering in `if` statements for **PHP** and **Go**,
-suggesting reorderings that short-circuit faster.
+A Neovim plugin that analyzes condition ordering in `if` statements and emits
+diagnostics when a cheaper check should be evaluated before an expensive one,
+enabling the short-circuit operator (`&&` / `||` / `and` / `or`) to skip work.
 
-Think of it like a performance linter: put cheap checks before expensive ones,
-and likely-to-fail checks before unlikely ones.
+Supported languages: **PHP**, **Go**, **Python** — with a simple language-module
+API for adding more.
 
 ## Requirements
 
 - Neovim >= 0.9
-- Treesitter with parsers installed:
+- nvim-treesitter with parsers for the languages you use:
   - PHP: `:TSInstall php`
   - Go: `:TSInstall go`
+  - Python: `:TSInstall python`
 
 ## Installation
 
@@ -19,7 +21,7 @@ and likely-to-fail checks before unlikely ones.
 ```lua
 {
   "akyrey/condition-order.nvim",
-  ft = { "php", "go" },
+  ft = { "php", "go", "python" },
   opts = {},
 }
 ```
@@ -54,7 +56,7 @@ When you trigger `vim.lsp.buf.code_action()` (typically `<leader>ca`), condition
 fixes appear alongside your LSP actions:
 
 ```
-⚡ Reorder conditions (cheapest first)
+⚡ Reorder conditions on line 12 (cheapest first)
 ⚡ Reorder ALL conditions in buffer (3 fixes)
 ```
 
@@ -73,28 +75,78 @@ if (!$user->isAdmin() && $isEnabled) { ... }
 if ($isEnabled && !$user->isAdmin()) { ... }
 ```
 
-Same in Go:
+Same in Go and Python (`not` is also treated as free):
 
 ```go
-// Before:
+// Go — before:
 if !user.IsAdmin() && enabled { ... }
-
 // After:
 if enabled && !user.IsAdmin() { ... }
 ```
 
-### Cost Model
+```python
+# Python — before:
+if not re.match(r"admin", name) and is_enabled: ...
+# After:
+if is_enabled and not re.match(r"admin", name): ...
+```
 
-Each expression type is assigned a cost score. The principle is the same across
-languages — how many CPU cycles does this burn before returning a boolean?
+### Safety Guarantees
 
-#### PHP Costs
+Auto-fixes are **blocked** (a diagnostic is still shown) when:
+
+- An operand **contains a call with observable side effects** (e.g. `createUser()`,
+  `open(...)`, `http.Get(...)`) — moving it earlier would change program behavior.
+- A **null / nil / None guard** would be moved after an expression that depends on it
+  (e.g. `$obj !== null && $obj->name` must not become `$obj->name && $obj !== null`).
+- An operand **spans multiple lines** — the formatter would collapse them.
+- An operand **contains a comment** — the comment would be lost.
+
+You can opt a specific condition out with an inline comment:
+
+```php
+if ($user->isAdmin() && $isEnabled) { } // condition-order: ignore
+```
+
+```python
+if expensive_check() and flag:  # condition-order: ignore
+    pass
+```
+
+### Opt-out Per Buffer
+
+```lua
+vim.b.condition_order_disable = true  -- disables analysis for this buffer
+```
+
+### Statusline Integration
+
+```lua
+-- lualine example
+require("lualine").setup({
+  sections = {
+    lualine_x = {
+      function()
+        local n = require("condition-order").count()
+        return n > 0 and ("⚡ " .. n) or ""
+      end,
+    },
+  },
+})
+```
+
+## Cost Model
+
+Each expression type is assigned a cost score (how many CPU cycles does this
+burn before returning a boolean?). The principle is the same across languages.
+
+### PHP
 
 | Expression Type          | Cost | Rationale                          |
 |--------------------------|------|------------------------------------|
 | Literal / boolean / null | 1    | Essentially free                   |
 | Variable                 | 2    | Single memory lookup               |
-| isset / empty / is_*     | 3    | Language construct, very cheap      |
+| isset / empty / is_*     | 3    | Language construct, very cheap     |
 | Class::CONST             | 3    | Resolved at compile time           |
 | Array access `$a['k']`   | 4    | Hash lookup                        |
 | Property access `->prop` | 5    | Object dereference                 |
@@ -103,7 +155,7 @@ languages — how many CPU cycles does this burn before returning a boolean?
 | Object creation          | 12   | Allocation + constructor           |
 | DB / IO calls            | 20   | Network/disk bound                 |
 
-#### Go Costs
+### Go
 
 | Expression Type              | Cost | Rationale                        |
 |------------------------------|------|----------------------------------|
@@ -122,18 +174,41 @@ languages — how many CPU cycles does this burn before returning a boolean?
 | os.Open / os.ReadFile        | 20   | Filesystem IO                    |
 | http.Get / sql queries       | 20-25| Network bound                    |
 
+### Python
+
+| Expression Type              | Cost | Rationale                        |
+|------------------------------|------|----------------------------------|
+| Literal / True / False / None| 1    | Essentially free                 |
+| Identifier (variable)        | 2    | Name lookup                      |
+| len() / bool() / id()        | 2-3  | Builtin, minimal overhead        |
+| isinstance() / hasattr()     | 3-4  | Type introspection               |
+| Attribute access `obj.attr`  | 4    | Pointer chase + descriptor       |
+| Subscript `obj[key]`         | 5    | `__getitem__` call               |
+| any() / all() / min() / max()| 5    | Iteration                        |
+| call (generic)               | 8    | Function call overhead           |
+| re.match / re.search         | 8    | Regex engine                     |
+| os.path.exists               | 8    | Syscall                          |
+| requests.get / .post         | ∞    | Network I/O — also blocks fix    |
+| open / subprocess.run        | ∞    | I/O — also blocks fix            |
+
 ## Configuration
 
 ```lua
 require("condition-order").setup({
-  -- Filetypes to analyze
-  filetypes = { "php", "go" },
+  -- Filetypes to analyze (default: php, go, python)
+  filetypes = { "php", "go", "python" },
 
   -- Minimum cost difference to trigger a warning
   threshold = 2,
 
-  -- Auto-analyze on save
+  -- Auto-analyze on save / open
   auto_analyze = true,
+
+  -- Milliseconds to debounce autocmd-triggered analysis
+  analyze_debounce_ms = 300,
+
+  -- Skip analysis when buffer exceeds this many bytes (nil = no limit)
+  max_buffer_bytes = nil,
 
   -- Diagnostic severity (HINT, INFO, WARN, ERROR)
   severity = vim.diagnostic.severity.HINT,
@@ -149,20 +224,29 @@ require("condition-order").setup({
     -- Go examples
     ["mydb.Query"]    = 20,
     ["cache.Get"]     = 12,
+    -- Python examples
+    ["my_app.db.query"] = 20,
   },
 
   -- Patterns considered "IO/expensive" (matched against function names)
   expensive_patterns = {
-    -- PHP
     "query", "fetch", "find", "load",
     "file_get_contents", "curl",
-    "Http::get", "Http::post",
-    "DB::table", "DB::select",
-    -- Go
+    "Http::get", "Http::post", "DB::table",
     "ReadFile", "WriteFile", "ReadAll", "ReadDir",
-    "ListenAndServe", "Dial", "LookupHost",
-    ".Scan", ".Next",
+    "ListenAndServe", ".Scan", ".Next",
   },
+
+  -- Function names to treat as side-effect-free even if not in the stdlib list.
+  -- Useful for your application's pure helper functions.
+  assume_pure = {
+    -- PHP: "Cache::get", "myhelper.IsPending"
+    -- Python: "myapp.utils.is_valid"
+  },
+
+  -- Comment text that suppresses a diagnostic on the same line(s).
+  -- Set to "" to disable.
+  ignore_comment = "condition-order: ignore",
 })
 ```
 
@@ -171,35 +255,73 @@ require("condition-order").setup({
 ```
 condition-order.nvim/
 ├── plugin/
-│   └── condition-order.vim    # VimL loader (guards double-load)
+│   └── condition-order.lua        # Loader guard + auto-setup
 └── lua/condition-order/
-    ├── init.lua               # Setup, commands, autocommands
-    ├── config.lua             # User options with defaults
-    ├── cost.lua               # Cost model (PHP + Go tables, scoring engine)
-    ├── analyzer.lua           # AST walker, chain flattening, diagnostics
-    └── actions.lua            # Code action provider (lightbulb integration)
+    ├── init.lua                   # Setup, commands, autocommands
+    ├── config.lua                 # User options with defaults
+    ├── util.lua                   # Shared helpers (node_text, display)
+    ├── cost.lua                   # Language registry + scoring engine
+    ├── analyzer.lua               # AST walker, chain flattening, diagnostics
+    ├── actions.lua                # Code action provider (lightbulb integration)
+    └── languages/
+        ├── php.lua                # PHP cost table + AST hints + call resolver
+        ├── go.lua                 # Go cost table + AST hints + call resolver
+        └── python.lua             # Python cost table + AST hints + call resolver
 ```
 
-The data flow is: **Treesitter AST → analyzer flattens chains → cost scores each operand → diagnostics emitted → actions offer fixes**.
+Data flow: **Treesitter AST → analyzer flattens chains → cost engine scores each
+operand → diagnostics emitted → actions offer fixes**.
 
-## Extending
+## Extending — Adding a New Language
 
-### Adding a new language
+Create `lua/condition-order/languages/<name>.lua` returning a spec table, then
+register it before or during `setup()`:
 
-1. Add a cost table in `cost.lua` (e.g., `M.python_costs`)
-2. Add known function costs (e.g., `M.python_known_functions`)
-3. Add the language's condition-context node types in `analyzer.lua`'s walker
-4. Add function name resolution for the language's call expression shape
-5. Add the filetype to your config
+```lua
+-- lua/condition-order/languages/ruby.lua
+local M = {}
+
+M.filetype = "ruby"
+M.ts_lang  = "ruby"
+
+M.costs = {
+  ["integer"] = 1, ["identifier"] = 2,
+  ["call"] = 8, ["method_call"] = 10,
+  -- ...
+}
+M.known_functions    = { ["nil?"] = 2, ["is_a?"] = 3 }
+M.impure_functions   = { ["puts"] = true, ["system"] = true }
+M.condition_starters = { if_node = true, while_modifier = true }
+M.body_nodes         = { then_node = true, do_block = true }
+M.func_boundaries    = { method_definition = true, program = true }
+M.call_node_types    = { call = true, method_call = true }
+M.logical_binary_node_types = { binary = true }
+M.negation_node_types = { "unary" }
+M.negation_ops        = { "!" }
+
+function M.resolve_call_name(node, bufnr)
+  -- ... language-specific call name extraction
+  return vim.treesitter.get_node_text(node:named_child(0), bufnr), nil
+end
+
+return M
+```
+
+```lua
+-- In your Neovim config, before or inside condition-order setup:
+local cost = require("condition-order.cost")
+cost.register_language("ruby", require("path.to.languages.ruby"))
+
+require("condition-order").setup({
+  filetypes = { "php", "go", "python", "ruby" },
+})
+```
 
 ### Custom cost overrides for your codebase
-
-If your project has specific expensive functions, add them via `cost_overrides`:
 
 ```lua
 require("condition-order").setup({
   cost_overrides = {
-    -- Your app's heavy hitters
     ["ElasticSearch::search"] = 25,
     ["Redis::pipeline"]       = 12,
     ["elasticsearch.Search"]  = 25,
